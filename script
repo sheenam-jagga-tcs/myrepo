@@ -1,0 +1,651 @@
+/* Change History
+* <Date>                   <Author's Name>       /* Change History
+* <Date> <Author's Name> <Jira #> <Brief Description of Change>
+* 01/09/2021 Giriraj Ranaware ACP-4149 Added condition to set Approval Factor to 1 for manual bundled products.
+* 02/09/2021 Giriraj Ranaware ACP-4276 Update in special price calculation logic according to AC.
+* 14/09/2021 Giriraj Ranaware ACP-1958 Updated to populate the Quote Lines "Parent Line Item Number" for child products of a bundle.
+* 11/10/2021 Giriraj Ranaware ACP-4420 Updated the code to not consider Usage Indicator for SAP callout
+* 07/03/2022 Vikas Mishra     ACP-4680 Added Rounding picklist field in QuoteLineItem and Rounding-off the NetUnitPriceInclMarkup based on user selection.
+* 06/04/2022 Arpan Ganguly    INC0503066 changed FloorPrice__c to Floor_Price__c
+*/
+
+const PATH = "/services/apexrest/pricing/"
+export function onBeforePriceRules(quote, lines, conn) {
+console.log(lines);
+if (lines.length === 0) {
+return Promise.resolve();
+}
+//create a array of quote line. add the fields whichever we need to send to sap
+var quoteLines = [];
+let productIds = [];
+quote.record.GetPriceErrorMessage__c = '';
+for (var i = 0; i < lines.length; i++) {
+console.log(lines[i].record)
+if (!lines[i].record.ManualItem__c) {
+let quoteLine = {};
+quoteLine.index = lines[i].record.SBQQ__Number__c;
+quoteLine.quantity = lines[i].record.SBQQ__Quantity__c;
+quoteLine.SAPMaterialNum = lines[i].record.SAPMaterialNumber__c;
+quoteLine.contractNum = lines[i].record.ContractNumber__c;
+quoteLine.contractPositionNum = lines[i].record.ContractNumberPosition__c;
+quoteLine.contractModel = lines[i].record.SBQQ__Quote__r.ContractModel__c;
+quoteLine.contractItem = lines[i].record.ContractedItem__c;
+quoteLine.taxClassification = lines[i].record.TaxClassification__c;
+quoteLine.quoteId = lines[i].record.SBQQ__Quote__c;
+
+//ACP-1958 Added below section to populate the "Parent Line Item Number" field for child products of a POS bundle (ZPB)
+quoteLine.requiredBy = lines[i].record.SBQQ__RequiredBy__c;	
+
+
+if (lines[i].record.SBQQ__RequiredBy__c !== null) 
+{
+quoteLine.parentLineItemNumber = lines[i].record.ParentLineItemNumber__c; // Formula field to hold the Parent Line Item Number for POS Bundle Options.
+
+}					
+productIds.push(lines[i].record.SBQQ__Product__c);			
+quoteLines.push(quoteLine);
+}
+}
+
+//create the product list and salesorg list
+var codeList = "('" + productIds.join("', '") + "')";
+var salesOrg = "('" + quote.record.SalesOrganization__c + "')";
+
+//query the metadata record
+let localChargeSetting = [];
+conn.query('SELECT Label,SalesOrganization__c FROM LocalChargesSetting__mdt WHERE SalesOrganization__c IN' + salesOrg)
+.then(function (results) {
+console.log('====' + results.records);
+console.log(results.records);
+localChargeSetting = results.records;
+}).catch(error => {
+console.error(error);
+quote.record.GetPriceErrorMessage__c = error.message.length > 220 ? error.message.substring(0, 220) : error.message;
+})
+
+let quoteId = "('" + quote.record.Id + "')";
+conn.query('SELECT Id,ExternalIDDSAF__c,ExternalIDAC__c,ExternalIDAS__c,SBQQ__Status__c,SBQQ__Primary__c,MaxApprovalFactor__c FROM SBQQ__Quote__c WHERE Id IN ' + quoteId)
+.then(function (result) {
+quote.record.ExternalIDDSAF__c = result.records[0].ExternalIDDSAF__c;
+quote.record.ExternalIDAC__c = result.records[0].ExternalIDAC__c;
+quote.record.ExternalIDAS__c = result.records[0].ExternalIDAS__c;
+quote.record.SBQQ__Status__c = result.records[0].SBQQ__Status__c;
+quote.record.SBQQ__Primary__c = result.records[0].SBQQ__Primary__c;
+quote.record.MaxApprovalFactor__c = result.records[0].MaxApprovalFactor__c;
+}).catch(error => {
+console.error(error);
+quote.record.GetPriceErrorMessage__c = error.message.length > 220 ? error.message.substring(0, 220) : error.message;
+})
+
+//create a body,org url and do a post call to apex and store the response in pricResponse
+const body = {
+quoteLinesJson: JSON.stringify(quoteLines)
+};
+
+
+const baseUrl = conn.instanceUrl + PATH;
+const url = baseUrl.replace("--sbbq.visualforce", ".my.salesforce");
+return conn
+.requestPost(url, body)
+.then(res => {
+const priceResponse = JSON.parse(res);
+var prodPrices = ((priceResponse['ns0:Z_SD_PRICING_SIMULATE_ACEResponse']['ES_VBAK'])['T_VBAP'])['item'];
+if (prodPrices === undefined) {
+for (var i = 0; i < lines.length; i++) {
+lines[i].record.SBQQ__SpecialPriceDescription__c = "Price received from external system";
+//if demo price is provided then override the special price
+if (lines[i].record.DemoPrice__c != null && lines[i].record.ItemCategory__c === 'ZDEM') {
+lines[i].record.SBQQ__SpecialPriceType__c = "Custom";
+lines[i].record.SBQQ__SpecialPrice__c = lines[i].record.DemoPrice__c;
+}
+
+}
+let errorMessgae = (priceResponse['ns0:Z_SD_PRICING_SIMULATE_ACEResponse']['ET_MSG'])['item'];
+let errMessgae
+if (Array.isArray(errorMessgae)) {
+errMessgae = errorMessgae.find(err => {
+return err.TYPE === 'E' || err.TYPE === 'A'
+});
+} else {
+if (errorMessgae.TYPE === 'E' || errorMessgae.TYPE === 'A') {
+errMessgae = errorMessgae;
+}
+}
+
+if (errMessgae != undefined) {
+quote.record.GetPriceErrorMessage__c = errMessgae.MESSAGE.length > 220 ? errMessgae.MESSAGE.substring(0, 220) : errMessgae.MESSAGE;
+}
+
+} else {
+priceLines(lines, prodPrices, localChargeSetting);
+}
+}).catch(err => {
+quote.record.GetPriceErrorMessage__c = err.message.length > 220 ? err.message.substring(0, 220) : err.message
+})
+}
+
+
+function priceLines(lines, priceArray, localChargeSetting) {
+for (var i = 0; i < lines.length; i++) {
+let externalPrice;
+if (priceArray) {
+let num = lines[i].record.SBQQ__Number__c;
+//if priceArray (item) is 1 product then directly assign priceArray to externalPrice variable based on posex and sap material number
+if (priceArray.length === undefined) {
+if (priceArray.MATNR === lines[i].record.SAPMaterialNumber__c && priceArray.POSEX === num.toString()) {
+externalPrice = priceArray;
+} else {
+lines[i].record.SBQQ__SpecialPriceDescription__c = "No price from external system";
+}
+} else {
+//check if priceArrray's SapMaterialNumber and posex is matching with quoteline's SapMaterialNumber and posex then return that item in externalPrice
+externalPrice = priceArray.find(price => {
+return price.MATNR === lines[i].record.SAPMaterialNumber__c && price.POSEX === num.toString()
+});
+
+}
+}
+//if external price is present then perform the calculation
+if (externalPrice) {
+//if ZZMULTICONTR is blank the product doesnt contain mutiple contract so mark the line item's HasMultipleContracts__c as false otherwise true
+if (externalPrice["ZZMULTICONTR"] === "") {
+lines[i].record.HasMultipleContracts__c = false;
+} else {
+lines[i].record.HasMultipleContracts__c = true;
+}
+//if externalPrice contains netwr then update the specialPriceType to custo and description to Price received from external system
+if (externalPrice["NETWR"] != null) {
+lines[i].record.SBQQ__SpecialPriceType__c = "Custom";
+lines[i].record.SBQQ__SpecialPriceDescription__c = "Price received from external system";
+
+//get the item node values
+let kschl = externalPrice["T_KONV"]["item"];
+//assign specialPrice with special price from NETWR
+let specialPrice = externalPrice["NETWR"];
+
+//check if line item contains ZPCT in KSCHL node then return that node store it in zpct
+let zpct = kschl.find(vat => {
+return vat.KSCHL === "ZPCT" && vat.KINAK === ""
+});
+
+if (zpct !== undefined) {
+let zpctValue = zpct["KWERT"]
+lines[i].record.ZPCT__c = parseFloat(zpctValue) / lines[i].record.SBQQ__Quantity__c; // Calculate Unit Price.
+} else {
+lines[i].record.ZPCT__c = null;
+}
+
+//check if line item contains ZKUM in KSCHL node then return that node store it in zkum
+let zkum = kschl.find(vat => {
+return vat.KSCHL === "ZKUM"
+});
+
+if (zkum !== undefined) {
+let zkumValue = zkum["KWERT"]
+lines[i].record.ZKUM__c = parseFloat(zkumValue) / lines[i].record.SBQQ__Quantity__c; // Calculate Unit Price.
+}
+
+//check if line item contains ZKUM in KSCHL node then return that node store it in zkum
+let zp2 = kschl.find(vat => {
+return vat.KSCHL === "ZP2" && vat.KINAK === ""
+});
+
+if (zp2 !== undefined) {
+let zp2Value = zp2["KWERT"]
+lines[i].record.ZP2__c = parseFloat(zp2Value) / lines[i].record.SBQQ__Quantity__c; // Calculate Unit Price.
+} else {
+lines[i].record.ZP2__c = null;
+}
+
+//check if line item contains ZKUM in KSCHL node then return that node store it in zkum
+let zp1 = kschl.find(vat => {
+return vat.KSCHL === "ZP1" && vat.KINAK === ""
+});
+
+if (zp1 !== undefined) {
+let zp1Value = zp1["KWERT"]
+lines[i].record.ZP1__c = parseFloat(zp1Value) / lines[i].record.SBQQ__Quantity__c; // Calculate Unit Price.
+} else {
+lines[i].record.ZP1__c = null;
+}
+
+
+//if zpct value is present then get the special price from KWERT of zpct
+//else check if local product itemcategory is zest then get the special price from zkum's KWERT
+
+
+if ((lines[i].record.ItemCategoryGroup__c === "ZSET" || lines[i].record.ItemCategoryGroup__c === "ZRAC")) {
+specialPrice = zkum["KWERT"];
+}
+
+
+//ACP-4276 Added below code block to get values of Nodes ZDIF, DIFF, RNTP, RNTM nodes to add/subtract from special price based on SAP ERP rounding condition.
+
+let zdifValue = kschl.find(zdif => {
+return zdif.KSCHL === "ZDIF"
+});
+if (zdifValue != undefined) {
+specialPrice = parseFloat(specialPrice) - parseFloat(zdifValue["KWERT"]);
+}
+
+let diffValue = kschl.find(diff => {
+return diff.KSCHL === "DIFF"
+});
+if (diffValue != undefined) {
+specialPrice = parseFloat(specialPrice) - parseFloat(diffValue["KWERT"]);
+}
+
+let rntmValue = kschl.find(rntm => {
+return rntm.KSCHL === "RNTM"
+});
+if (rntmValue != undefined) {
+specialPrice = parseFloat(specialPrice) - parseFloat(rntmValue["KWERT"]);
+}
+
+let rntpValue = kschl.find(rntp => {
+return rntp.KSCHL === "RNTP"
+});
+if (rntpValue != undefined) {
+specialPrice = parseFloat(specialPrice) + parseFloat(rntpValue["KWERT"]);
+}
+
+
+//as all the special which we recieved is specialprice* quantity. Hence divide the specialPrice by quantity and assign that to specialPrice field of line Item
+//If lineItem's productCategory is Service Contract then copy the special price value to list price
+lines[i].record.SBQQ__SpecialPrice__c = parseFloat(specialPrice) / lines[i].record.SBQQ__Quantity__c; // Calculate Unit Price.
+if (lines[i].record.ProductCategory__c === "Service Contract") {
+lines[i].record.SBQQ__ListPrice__c = lines[i].record.SBQQ__SpecialPrice__c;
+}
+//assign the vat value from KBETR value if KSCHL node is MWST
+let vatValue = kschl.find(vat => {
+return vat.KSCHL === "MWST"
+});
+if (vatValue != undefined) {
+lines[i].record.VAT__c = vatValue["KBETR"];
+}
+
+let localTax = 0;
+
+if (lines[i].record.ItemCategoryGroup__c !== "ZSET") {
+//below logic is to calculate the local tax
+let zec1Value = kschl.find(zec1 => {
+return zec1.KSCHL === "ZEC1"
+});
+if (zec1Value != undefined) {
+lines[i].record.ZEC1__c = zec1Value["KWERT"];
+localTax = localTax + zec1Value["KWERT"];
+}
+let zec2Value = kschl.find(zec2 => {
+return zec2.KSCHL === "ZEC2"
+});
+if (zec2Value != undefined) {
+lines[i].record.ZEC2__c = zec2Value["KWERT"];
+localTax = localTax + zec2Value["KWERT"];
+}
+let zec3Value = kschl.find(zec3 => {
+return zec3.KSCHL === "ZEC3"
+});
+if (zec3Value != undefined) {
+lines[i].record.ZEC3__c = zec3Value["KWERT"];
+localTax = localTax + zec3Value["KWERT"];
+}
+let zbcValue = kschl.find(zbc => {
+return zbc.KSCHL === "ZBC"
+});
+if (zbcValue != undefined) {
+lines[i].record.ZBC__c = zbcValue["KWERT"];
+localTax = localTax + zbcValue["KWERT"];
+}
+let zwcValue = kschl.find(zwc => {
+return zwc.KSCHL === "ZWC"
+});
+if (zwcValue != undefined) {
+lines[i].record.ZWC__c = zwcValue["KWERT"];
+localTax = localTax + zwcValue["KWERT"];
+}
+let zec4Value = kschl.find(zec4 => {
+return zec4.KSCHL === "ZEC4"
+});
+if (zec4Value != undefined) {
+lines[i].record.ZEC4__c = zec4Value["KWERT"];
+localTax = localTax + zec4Value["KWERT"];
+}
+let zec5Value = kschl.find(zec5 => {
+return zec5.KSCHL === "ZEC5"
+});
+if (zec5Value != undefined) {
+lines[i].record.ZEC5__c = zec5Value["KWERT"];
+localTax = localTax + zec5Value["KWERT"];
+}
+let zec6Value = kschl.find(zec6 => {
+return zec6.KSCHL === "ZEC6"
+});
+if (zec6Value != undefined) {
+lines[i].record.ZEC6__c = zec6Value["KWERT"];
+localTax = localTax + zec6Value["KWERT"];
+}
+
+}
+
+if (lines[i].record.ItemCategoryGroup__c === "ZSET") {
+
+localTax = headerWoPriceLocalTaxCalc(lines[i], priceArray, externalPrice.POSNR);
+}
+
+//special price calcualtion based on local tax on country based
+////SBQQ__SpecialPrice__c - [ (ZEC1 + ZEC2 + ZEC3 + ZBC + ZWC + ZEC4 + ZEC5 + ZEC6 ) / SBQQ__Quantity__c]
+if (localChargeSetting.length > 0) {
+if (localTax > 0) {
+lines[i].record.SBQQ__SpecialPrice__c = lines[i].record.SBQQ__SpecialPrice__c - (parseFloat(localTax) / lines[i].record.SBQQ__Quantity__c);
+}
+//for VAT % on Local Charges
+let vatOnLocalChargeValue = kschl.find(pPrice => {
+return pPrice.KSCHL === "ZMWT"
+})
+if (vatOnLocalChargeValue != undefined && lines[i].record.ItemCategoryGroup__c !== "ZSET") {
+lines[i].record.VATPercentOnLocalCharges__c = vatOnLocalChargeValue["KBETR"]
+lines[i].record.VATOnLocalCharges__c = vatOnLocalChargeValue["KWERT"]
+}
+}
+
+//for purchase price ACP-3424
+let purchasePriceValue = kschl.find(pPrice => {
+return pPrice.KSCHL === "ZIC1"
+});
+if (purchasePriceValue != null) {
+lines[i].record.PurchasePrice__c = purchasePriceValue["KWERT"];
+} else {
+if (lines[i].record.ProductCategory__c === 'Service Contract') {
+lines[i].record.PurchasePrice__c = lines[i].record.SBQQ__ListPrice__c / 2
+}
+lines[i].record.PurchasePrice__c = lines[i].record.SBQQ__ListPrice__c * lines[i].record.SBQQ__Quantity__c * 0.50;
+}
+//if demo price is provided then override the special price
+if (lines[i].record.DemoPrice__c != null && lines[i].record.ItemCategory__c === 'ZDEM') {
+lines[i].record.SBQQ__SpecialPrice__c = lines[i].record.DemoPrice__c;
+}
+
+} else {
+lines[i].record.SBQQ__SpecialPriceDescription__c = "No price from external system";
+}
+}
+}
+}
+
+
+function headerWoPriceLocalTaxCalc(lines, priceArray, setheadernode) {
+
+
+let ueposnode = priceArray.filter(price => {
+return price.UEPOS === setheadernode;
+});
+
+
+let zec1, zec2, zec3, zec4, zec5, zec6, zbc, zwc, VAT;
+let zec1tax = 0,zec2tax = 0,zec3tax = 0,zec4tax = 0,zec5tax = 0,zec6tax = 0,zbctax = 0,zwctax = 0,VATtax = 0,localtaxcomponents = 0,VATtaxPercent = 0;
+
+
+for (var j = 0; j < ueposnode.length; j++) {
+let ecotaxnodes = ueposnode[j]["T_KONV"]["item"];
+
+zec1 = ecotaxnodes.find(tax1 => {
+return tax1.KSCHL === "ZEC1";
+});
+if (zec1 != undefined) {
+zec1tax = zec1tax + parseFloat(zec1["KWERT"]);
+}
+
+zec2 = ecotaxnodes.find(tax2 => {
+return tax2.KSCHL === "ZEC2";
+});
+if (zec2 != undefined) {
+zec2tax = zec2tax + parseFloat(zec2["KWERT"]);
+}
+
+zec3 = ecotaxnodes.find(tax3 => {
+return tax3.KSCHL === "ZEC3";
+});
+if (zec3 != undefined) {
+zec3tax = zec3tax + parseFloat(zec3["KWERT"]);
+}
+
+zec4 = ecotaxnodes.find(tax4 => {
+return tax4.KSCHL === "ZEC4";
+});
+if (zec4 != undefined) {
+zec4tax = zec4tax + parseFloat(zec4["KWERT"]);
+}
+
+zec5 = ecotaxnodes.find(tax5 => {
+return tax5.KSCHL === "ZEC5";
+});
+if (zec5 != undefined) {
+zec5tax = zec5tax + parseFloat(zec5["KWERT"]);
+}
+
+zec6 = ecotaxnodes.find(tax6 => {
+return tax6.KSCHL === "ZEC6";
+});
+if (zec6 != undefined) {
+zec6tax = zec6tax + parseFloat(zec6["KWERT"]);
+}
+
+zbc = ecotaxnodes.find(tax7 => {
+return tax7.KSCHL === "zbc";
+});
+if (zbc != undefined) {
+zbctax = zbctax + parseFloat(zbc["KWERT"]);
+}
+
+zwc = ecotaxnodes.find(tax8 => {
+return tax8.KSCHL === "zwc";
+});
+if (zwc != undefined) {
+zwctax = zwctax + parseFloat(zwc["KWERT"]);
+}
+
+VAT = ecotaxnodes.find(tax9 => {
+return tax9.KSCHL === "ZMWT";
+});
+if (VAT != undefined) {
+VATtax = VATtax + parseFloat(VAT["KWERT"]);
+VATtaxPercent = VATtaxPercent + parseFloat(VAT["KBETR"]);
+
+}
+
+}
+
+lines.record.ZEC1__c = zec1tax;
+lines.record.ZEC2__c = zec2tax;
+lines.record.ZEC3__c = zec3tax;
+lines.record.ZEC4__c = zec4tax;
+lines.record.ZEC5__c = zec5tax;
+lines.record.ZEC6__c = zec6tax;
+lines.record.ZBC__c = zbctax;
+lines.record.ZWC__c = zwctax;
+
+lines.record.VATOnLocalCharges__c = VATtax;
+lines.record.VATPercentOnLocalCharges__c = VATtaxPercent / ueposnode.length;
+
+
+localtaxcomponents = zec1tax + zec2tax + zec3tax + zec4tax + zec5tax + zec6tax + zbctax + zwctax;
+return localtaxcomponents;
+}
+
+export function onAfterPriceRules(quote, lines, conn) {
+return new Promise((resolve, reject) => {
+produtMapCalc(lines, quote, conn)
+return resolve();
+})
+
+}
+
+export function onAfterCalculate(quote, lines, conn) {
+return new Promise((resolve, reject) => {
+let approvalFactorList;
+
+let externalIDDSAF = "('" + quote.record.ExternalIDDSAF__c + "')";
+//get the ExternalIDDSAF__c value from quote record and query the approvalFactor table based that value
+conn.query('SELECT Id,ExternalID__c,UpperLimit__c,LowerLimit__c,ApprovalFactor__c FROM ApprovalFactor__c WHERE ExternalID__c IN ' + externalIDDSAF)
+.then(function (results) {
+approvalFactorList = results.records;
+approvalFactCal(approvalFactorList, lines, quote, conn);
+return resolve();
+}).catch(error => {
+quote.record.GetPriceErrorMessage__c = error.message.length > 220 ? error.message.substring(0, 220) : error.message;
+})
+})
+}
+
+
+function produtMapCalc(lines, quote, conn) {
+//get the list of productIds and query the product to get the floor price details of the product and store the detail in product map
+
+let productIds = [];
+for (let i = 0; i < lines.length; i++) {
+productIds.push(lines[i].record.SBQQ__Product__c);
+}
+let productMap = new Map();
+
+var codeList = "('" + productIds.join("', '") + "')";
+return new Promise((resolve, reject) => {
+conn.query('SELECT Id,ProductClassification__c,ProductCode FROM Product2 WHERE Id IN ' + codeList)
+.then(function (results) {
+let res = results.records;
+res.forEach(prd => {
+productMap.set(prd.Id, prd);
+})
+
+for (let i = 0; i < lines.length; i++) {
+//below changes are used in price rule.
+lines[i].record.ExternalIDPC__c = productMap.get(lines[i].record.SBQQ__Product__c).ProductClassification__c !== undefined ? quote.record.ExternalIDDSAF__c + productMap.get(lines[i].record.SBQQ__Product__c).ProductClassification__c : '';
+lines[i].record.ExternalIDBSS__c = quote.record.SalesOrganization__c + productMap.get(lines[i].record.SBQQ__Product__c).ProductCode;
+if (lines[i].record.ProductCategory__c === 'Disposable' && lines[i].record.SBQQ__NetPrice__c != null && quote.record.Markup__c != null) {
+    let actualNetunit = lines[i].record.SBQQ__NetPrice__c * (1 + (quote.record.Markup__c / 100));
+    switch(lines[i].record.Rounding__c){
+        case 'to full value x,00':
+            lines[i].record.NetUnitPriceinclMarkup__c = Math.round(actualNetunit);
+            break;
+        case 'to 1st decimal x,x0':
+            lines[i].record.NetUnitPriceinclMarkup__c = parseFloat(actualNetunit).toFixed(1);
+            break;
+        case '-0,05':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit - 0.05).toFixed(2);
+            break;
+        case '-0,04':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit - 0.04).toFixed(2);
+            break;
+        case '-0,03':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit - 0.03).toFixed(2);
+            break;
+        case '-0,02':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit - 0.02).toFixed(2);
+            break;
+        case '-0,01':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit - 0.01).toFixed(2);
+            break;
+        case '+0,01':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit + 0.01).toFixed(2);
+            break;
+        case '+0,02':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit + 0.02).toFixed(2);
+            break;
+        case '+0,03':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit + 0.03).toFixed(2);
+            break;
+        case '+0,04':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit + 0.04).toFixed(2);
+            break;
+        case '+0,05':
+            lines[i].record.NetUnitPriceinclMarkup__c = (actualNetunit + 0.05).toFixed(2);
+            break;
+        default:
+            lines[i].record.NetUnitPriceinclMarkup__c = actualNetunit;
+    }
+} else {
+        lines[i].record.NetUnitPriceinclMarkup__c = 0;
+}
+
+}
+resolve();
+}).catch(error => {
+quote.record.GetPriceErrorMessage__c = error.message.length > 220 ? error.message.substring(0, 220) : error.message;
+})
+})
+}
+
+function approvalFactCal(approvalFactorList, lines, quote, conn) {
+return new Promise((resolve, reject) => {
+//Max factor intialize with 0
+let maxFactorvar = 0;
+for (let i = 0; i < lines.length; i++) {
+let appFacvar
+//get floor price from product map
+//let floorPrice = lines[i].record.FloorPrice__c;
+let floorPrice = lines[i].record.Floor_Price__c;
+let totalTragetDiscount = lines[i].record.TotalTargetDiscount__c / 100;
+//calculate the total discount,delta Target Discount,target price using below formula
+let totalDiscount = ((lines[i].record.SBQQ__ListPrice__c - lines[i].record.SBQQ__NetPrice__c) / lines[i].record.SBQQ__ListPrice__c);
+//delta Target Discount
+let deltaTargetDiscount = (totalDiscount - totalTragetDiscount) * 100;
+//target price
+let targetPrice = lines[i].record.SBQQ__ListPrice__c - (lines[i].record.SBQQ__ListPrice__c * totalTragetDiscount);
+let additionalDiscount = (lines[i].record.SBQQ__RegularPrice__c - lines[i].record.SBQQ__CustomerPrice__c) * lines[i].record.SBQQ__EffectiveQuantity__c
+/*If product is manual item then no need to apply the approval factor logic and directly assign it to 2 else
+if there is no addtional discount then set the proval factor to 1 , else if there is floor price violation then approval factor 5
+else get the approval factor based on deltaTargetDiscount value is within the upper and lower limit of approval factor table */
+
+
+//ACP-4149: Added below if condition to check if the Line item is Manual and Hidden indicating Bundled Product
+if (lines[i].record.ManualItem__c && lines[i].record.SBQQ__Hidden__c) {
+lines[i].record.ApprovalFactor__c = 1;
+}
+
+//ACP-4149:Removed ManualItem condition from below if statement
+else if (lines[i].record.ManualItem__c || (lines[i].record.DemoPrice__c != null && lines[i].record.ItemCategory__c === 'ZDEM')) {
+lines[i].record.ApprovalFactor__c = 2;
+} else {
+if (!additionalDiscount) {
+lines[i].record.ApprovalFactor__c = 1;
+} else if (lines[i].record.SBQQ__NetPrice__c < floorPrice) {
+lines[i].record.ApprovalFactor__c = 5;
+
+} else {
+if (approvalFactorList) {
+let approvalFact = approvalFactorList.find(appfac => {
+	return deltaTargetDiscount >= appfac.LowerLimit__c && deltaTargetDiscount < appfac.UpperLimit__c
+})
+if (approvalFact) {
+	lines[i].record.ApprovalFactor__c = approvalFact.ApprovalFactor__c;
+} else {
+	lines[i].record.ApprovalFactor__c = 1;
+}
+}
+}
+}
+lines[i].record.DeltaTargetDiscount__c = deltaTargetDiscount;
+lines[i].record.TargetPrice__c = targetPrice;
+//calculate the max approval factor based on maximum value of approval factor of the line item
+if (lines[i].record.ApprovalFactor__c > maxFactorvar) {
+maxFactorvar = lines[i].record.ApprovalFactor__c
+}
+
+}
+quote.record.MaxApprovalFactor__c = maxFactorvar;
+
+})
+}
+export function isFieldVisibleForObject(fieldName, line, conn, objectName) {
+if (objectName === 'QuoteLine__c')
+if (fieldName === 'ManualVAT__c' && !line.ManualItem__c) {
+return false;
+}
+if (fieldName === 'SBQQ__Description__c' && !line.ManualItem__c) {
+return false;
+}
+}
+export function isFieldEditableForObject(fieldName, quote, conn, objectName) {
+if (objectName === 'QuoteLine__c' && fieldName === 'ManualItem__c') {
+return false;
+}
+}
